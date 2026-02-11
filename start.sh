@@ -1,14 +1,11 @@
 #!/bin/bash
 
 # Установка ffmpeg если не установлен
-if ! command -v ffmpeg &> /dev/null; then
-    echo "Устанавливаем ffmpeg..."
-    apt-get update
-    apt-get install -y ffmpeg
+if [ ! -f "bin/ffmpeg" ]; then
+    echo "🔄 Установка ffmpeg..."
+    bash install_ffmpeg.sh
 fi
 
-# Создаем директорию для видео
-mkdir -p videos
-
 # Запуск бота
+echo "🚀 Запуск бота..."
 python3 main.py
