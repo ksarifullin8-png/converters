@@ -4,6 +4,8 @@ import os
 import subprocess
 from datetime import datetime, timedelta
 from collections import deque
+import shutil
+import sys
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -23,21 +25,47 @@ ADMIN_ID = 7546928092
 
 DEFAULT_WEEKLY = 8
 PRICE_RUB = 2
-STAR_RUB = 1.5  # 1.5 рубля = 1 звезда
+STAR_RUB = 1.5
 
 SUPPORT = "@bydeass"
 OWNER = "@bydeass"
 
 DB = "bot.db"
 VIDEO_DIR = "videos"
+BIN_DIR = "bin"
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
+os.makedirs(BIN_DIR, exist_ok=True)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 video_queue = deque()
 processing = False
+
+# ================== FFMPEG PATH ==================
+
+def get_ffmpeg_path():
+    """Поиск ffmpeg в разных местах"""
+    
+    # 1. Сначала проверяем в ./bin/ffmpeg
+    local_ffmpeg = os.path.join(BIN_DIR, 'ffmpeg')
+    if os.path.exists(local_ffmpeg) and os.access(local_ffmpeg, os.X_OK):
+        return local_ffmpeg
+    
+    # 2. Проверяем в текущей директории
+    current_dir_ffmpeg = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg')
+    if os.path.exists(current_dir_ffmpeg) and os.access(current_dir_ffmpeg, os.X_OK):
+        return current_dir_ffmpeg
+    
+    # 3. Проверяем системный ffmpeg
+    system_ffmpeg = shutil.which('ffmpeg')
+    if system_ffmpeg:
+        return system_ffmpeg
+    
+    return None
+
+FFMPEG_PATH = get_ffmpeg_path()
 
 # ================== DATABASE ==================
 
@@ -186,73 +214,18 @@ def share_kb(ref_link):
         [InlineKeyboardButton(text="📤 ОТПРАВИТЬ РЕФЕРАЛЬНУЮ ССЫЛКУ", switch_inline_query="")]
     ])
 
-# ================== START ==================
-
-@dp.message(Command("start"))
-async def start(m: Message):
-    ensure_user(m.from_user)
-
-    args = m.text.split()
-    if len(args) > 1:
-        try:
-            ref_id = int(args[1])
-            if add_referral(m.from_user.id, ref_id):
-                await bot.send_message(ref_id, "🎉 Новый реферал! +1 кружок")
-                await bot.send_message(
-                    ADMIN_ID,
-                    f"👥 Реферал: {ref_id} ← {m.from_user.id}"
-                )
-        except ValueError:
-            pass
-
-    circles, limit = get_limits(m.from_user.id)
-    me = await bot.me()
-
-    ref_link = f"https://t.me/{me.username}?start={m.from_user.id}"
-    
-    await m.answer(
-        f"🎥 Кружки: {circles}/{limit}\n\n"
-        f"📹 Пришли видео — получишь кружок\n\n"
-        f"👥 Рефералка: 1 друг = 1 кружок\n"
-        f"🔗 Твоя ссылка: {ref_link}\n\n"
-        f"Поддержка: {SUPPORT}\nВладелец: {OWNER}",
-        reply_markup=main_kb()
-    )
-
-@dp.callback_query(F.data == "top")
-async def top(cb: CallbackQuery):
-    rows = get_top_referrals()
-    if not rows:
-        await cb.answer("Пока пусто")
-        return
-
-    text = "🏆 ТОП РЕФЕРАЛОВ\n\n"
-    for i, (uid, username, cnt) in enumerate(rows, 1):
-        user_text = f"@{username}" if username else f"ID: {uid}"
-        text += f"{i}. {user_text} — {cnt}\n"
-
-    await cb.message.edit_text(text, reply_markup=main_kb())
-
-@dp.callback_query(F.data == "back_to_main")
-async def back_to_main(cb: CallbackQuery):
-    circles, limit = get_limits(cb.from_user.id)
-    me = await bot.me()
-    ref_link = f"https://t.me/{me.username}?start={cb.from_user.id}"
-    
-    await cb.message.edit_text(
-        f"🎥 Кружки: {circles}/{limit}\n\n"
-        f"📹 Пришли видео — получишь кружок\n\n"
-        f"👥 Рефералка: 1 друг = 1 кружок\n"
-        f"🔗 Твоя ссылка: {ref_link}\n\n"
-        f"Поддержка: {SUPPORT}\nВладелец: {OWNER}",
-        reply_markup=main_kb()
-    )
-
 # ================== VIDEO CORE ==================
 
 def ffmpeg_circle(inp, out):
+    """Обработка видео с помощью ffmpeg"""
+    global FFMPEG_PATH
+    
+    if FFMPEG_PATH is None:
+        print("❌ FFMPEG не найден!")
+        return False
+    
     cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_PATH, "-y",
         "-i", inp,
         "-vf", "crop=min(in_w\\,in_h):min(in_w\\,in_h),scale=640:640",
         "-t", "60",
@@ -265,8 +238,17 @@ def ffmpeg_circle(inp, out):
         "-movflags", "+faststart",
         out
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Ошибка ffmpeg: {e}")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+        return False
+
 async def process_queue():
     global processing
     if processing:
@@ -286,37 +268,55 @@ async def process_queue():
         inp = f"{VIDEO_DIR}/in_{user_id}_{m.message_id}.mp4"
         out = f"{VIDEO_DIR}/out_{user_id}_{m.message_id}.mp4"
 
-        # Проверяем длительность видео перед обработкой
-        # Telegram Video Note limit is strictly 60 seconds
-        await bot.download(m.video, destination=inp)
-        await asyncio.to_thread(ffmpeg_circle, inp, out)
-
-        if not os.path.exists(out) or os.path.getsize(out) == 0:
-            await bot.send_message(user_id, "❌ Ошибка при обработке видео. Возможно, файл поврежден.")
-            continue
-
-        await bot.send_video_note(user_id, FSInputFile(out))
-        spend_circle(user_id)
-
-        with db() as c:
-            c.execute(
-                "UPDATE users SET videos_done = videos_done + 1 WHERE user_id=?",
-                (user_id,)
-            )
-
-        await wait_msg.edit_text("✅ Готово")
-
         try:
-            os.remove(inp)
-            os.remove(out)
-        except:
-            pass
+            # Скачиваем видео
+            await bot.download(m.video, destination=inp)
+            
+            # Обрабатываем
+            success = await asyncio.to_thread(ffmpeg_circle, inp, out)
+            
+            if not success or not os.path.exists(out) or os.path.getsize(out) == 0:
+                await bot.send_message(user_id, "❌ Ошибка при обработке видео. Попробуйте другое видео.")
+                continue
+
+            # Отправляем результат
+            await bot.send_video_note(user_id, FSInputFile(out))
+            spend_circle(user_id)
+
+            with db() as c:
+                c.execute(
+                    "UPDATE users SET videos_done = videos_done + 1 WHERE user_id=?",
+                    (user_id,)
+                )
+
+            await wait_msg.edit_text("✅ Готово")
+
+        except Exception as e:
+            await bot.send_message(user_id, f"❌ Ошибка: {str(e)[:100]}")
+            print(f"Error processing video: {e}")
+        
+        finally:
+            # Очищаем временные файлы
+            try:
+                if os.path.exists(inp):
+                    os.remove(inp)
+                if os.path.exists(out):
+                    os.remove(out)
+            except:
+                pass
 
     processing = False
 
 @dp.message(F.content_type == ContentType.VIDEO)
 async def handle_video(m: Message):
     ensure_user(m.from_user)
+    
+    # Проверяем наличие ffmpeg
+    if FFMPEG_PATH is None:
+        await m.answer("❌ Бот временно недоступен (ffmpeg не установлен). Администратор уже знает о проблеме.")
+        await bot.send_message(ADMIN_ID, "⚠️ Ошибка: ffmpeg не найден! Запустите install_ffmpeg.sh")
+        return
+    
     video_queue.append((m, m.from_user.id))
     asyncio.create_task(process_queue())
 
@@ -358,7 +358,6 @@ async def stars(cb: CallbackQuery):
     stars_amount = int((n * PRICE_RUB) / STAR_RUB)
     
     try:
-        # Для Telegram Stars (XTR) провайдер токен должен быть пустой строкой
         await bot.send_invoice(
             chat_id=cb.from_user.id,
             title="Кружки для видео",
@@ -408,7 +407,8 @@ async def stats(cb: CallbackQuery):
         f"🎯 Активных пользователей: {active_users}\n"
         f"🎥 Видео обработано: {vids}\n"
         f"💰 Кружков в системе: {total_circles}\n"
-        f"👥 Рефералов всего: {refs}",
+        f"👥 Рефералов всего: {refs}\n"
+        f"🔧 FFmpeg: {'✅' if FFMPEG_PATH else '❌'}",
         reply_markup=admin_kb()
     )
 
@@ -470,14 +470,11 @@ async def handle_admin_command(m: Message):
     
     user_id = user_data[0]
     
-    # Определяем тип команды по контексту
     if m.reply_to_message and "изменить лимит" in m.reply_to_message.text.lower():
-        # Изменение лимита
         update_weekly_limit(user_id, amount)
         await m.answer(f"✅ Лимит пользователя @{username} изменен на {amount}")
         await bot.send_message(user_id, f"⚙️ Ваш еженедельный лимит изменен на {amount} кружков!")
     else:
-        # Выдача кружков
         add_circles(user_id, amount)
         await m.answer(f"✅ Выдано {amount} кружков пользователю @{username}")
         await bot.send_message(user_id, f"🎁 Администратор выдал вам {amount} кружков!")
@@ -606,23 +603,33 @@ async def error_handler(event, exception):
 # ================== RUN ==================
 
 async def main():
+    # Проверка ffmpeg
+    global FFMPEG_PATH
+    FFMPEG_PATH = get_ffmpeg_path()
+    
+    print("🤖 Бот запускается...")
+    print(f"📁 Директория для видео: {VIDEO_DIR}")
+    print(f"💾 База данных: {DB}")
+    
+    if FFMPEG_PATH:
+        print(f"✅ FFmpeg найден: {FFMPEG_PATH}")
+    else:
+        print("❌ FFmpeg НЕ НАЙДЕН!")
+        print("📥 Загрузите ffmpeg вручную или запустите install_ffmpeg.sh")
+        print("   Команда: bash install_ffmpeg.sh")
+    
     # Инициализация БД
     init_db()
     
-    # Очистка старых временных файлов при запуске
+    # Очистка старых временных файлов
     for f in os.listdir(VIDEO_DIR):
         try:
             os.remove(os.path.join(VIDEO_DIR, f))
         except:
             pass
     
-    print("🤖 Бот запущен на BoтHost!")
-    print(f"📁 Директория для видео: {VIDEO_DIR}")
-    print(f"💾 База данных: {DB}")
-    
     # Запускаем бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # Для BotHost - просто запускаем бота
     asyncio.run(main())
